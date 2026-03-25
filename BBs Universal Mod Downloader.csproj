@@ -1,0 +1,45 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<TargetFramework>net9.0-windows</TargetFramework>
+		<RootNamespace>BBs_Universal_Mod_Downloader</RootNamespace>
+		<UseWPF>true</UseWPF>
+
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+
+		<RuntimeIdentifier>win-x64</RuntimeIdentifier>
+		<SelfContained>true</SelfContained>
+		<PublishSingleFile>true</PublishSingleFile>
+		<EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+		<IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+
+		<UICulture>de</UICulture>
+		<SatelliteResourceLanguages>de</SatelliteResourceLanguages>
+
+		<DebugSymbols>false</DebugSymbols>
+		<DebugType>none</DebugType>
+
+		<Version>0.0.0-dev</Version>
+		<AssemblyVersion>0.0.0.0</AssemblyVersion>
+		<FileVersion>0.0.0.0</FileVersion>
+		<InformationalVersion>0.0.0-dev</InformationalVersion>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<None Remove="Sounds\MinecraftMenuSound.wav" />
+		<None Remove="Sounds\SecretSound.wav" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<EmbeddedResource Include="Sounds\MinecraftMenuSound.wav" />
+		<EmbeddedResource Include="Sounds\SecretSound.wav" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="NAudio" Version="2.3.0" />
+		<PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+	</ItemGroup>
+
+</Project>

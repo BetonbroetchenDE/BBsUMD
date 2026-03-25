@@ -1,0 +1,100 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version ohne v, z. B. 1.0.0'
+        required: true
+        type: string
+      prerelease:
+        description: 'Als Pre-Release markieren'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2025
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Resolve version and tag
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ inputs.version }}".Trim()
+            if ([string]::IsNullOrWhiteSpace($version)) {
+              throw "Die Version darf nicht leer sein."
+            }
+
+            $tag = "v$version"
+          }
+          elseif ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+            $version = $tag.TrimStart('v','V')
+          }
+          else {
+            throw "Unsupported trigger: event=${{ github.event_name }}, ref_type=${{ github.ref_type }}, ref=${{ github.ref }}"
+          }
+
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Ungültige Version '$version'. Erwartet z. B. 1.0.0"
+          }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Publish app
+        shell: pwsh
+        run: |
+          dotnet publish `
+            -c Release `
+            -r win-x64 `
+            /p:Version=${{ steps.meta.outputs.version }} `
+            /p:AssemblyVersion=${{ steps.meta.outputs.version }}.0 `
+            /p:FileVersion=${{ steps.meta.outputs.version }}.0 `
+            /p:InformationalVersion=${{ steps.meta.outputs.tag }}
+
+      - name: Compute SHA256
+        id: hash
+        shell: pwsh
+        run: |
+          $exe = "bin/Release/net9.0-windows/win-x64/publish/BBs Universal Mod Downloader.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "$exe.sha256" -Value $hash -NoNewline
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $args = @(
+            "release", "create", "${{ steps.meta.outputs.tag }}",
+            "bin/Release/net9.0-windows/win-x64/publish/BBs Universal Mod Downloader.exe",
+            "bin/Release/net9.0-windows/win-x64/publish/BBs Universal Mod Downloader.exe.sha256",
+            "--title", "${{ steps.meta.outputs.tag }}",
+            "--generate-notes",
+            "--target", "${{ github.sha }}"
+          )
+
+          if ("${{ inputs.prerelease }}" -eq "true") {
+            $args += "--prerelease"
+          }
+
+          gh @args
