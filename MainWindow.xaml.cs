@@ -1,5 +1,6 @@
 ﻿using NAudio.Wave;
 using Newtonsoft.Json;
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Media;
@@ -16,8 +17,16 @@ namespace BBs_Universal_Mod_Downloader
 {
     public partial class MainWindow : Window
     {
+        // =========================================================
+        // Static clients
+        // =========================================================
+
         private static readonly HttpClient apiClient = CreateApiHttpClient();
         private static readonly HttpClient downloadClient = CreateDownloadHttpClient();
+
+        // =========================================================
+        // Fields
+        // =========================================================
 
         private readonly SoundPlayer _clickPlayer = new();
         private readonly CancellationTokenSource _cts = new();
@@ -26,15 +35,6 @@ namespace BBs_Universal_Mod_Downloader
 
         private Task? _retryLoopTask;
 
-        private enum ViewState
-        {
-            Loading,
-            Error,
-            Main
-        }
-
-        private ViewState CurrentView = ViewState.Loading;
-
         private WaveOutEvent? _nyanOutput;
         private WaveChannel32? _nyanVolume;
         private WaveFileReader? _nyanReader;
@@ -42,66 +42,141 @@ namespace BBs_Universal_Mod_Downloader
         private string _selectedGameName = string.Empty;
         private bool _selectedGameInstalled = false;
         private string? _selectedGameModFolder;
-        private string _selectedGameModList = string.Empty;
 
         private Func<Task>? _popupPrimaryActionAsync;
         private Func<Task>? _popupSecondaryActionAsync;
         private bool _popupAllowsBackdropClose = true;
 
+        private readonly ObservableCollection<ServerModRow> _serverMods = [];
+        private readonly ObservableCollection<LocalModRow> _localMods = [];
+
+        // =========================================================
+        // Enums
+        // =========================================================
+
+        private enum ViewState
+        {
+            Loading,
+            Error,
+            Main,
+            ModManager
+        }
+
+        private ViewState CurrentView = ViewState.Loading;
+
+        // =========================================================
+        // DTOs / View Models
+        // =========================================================
+
+        public class PingResponse
+        {
+            public bool Ok { get; set; }
+            public string? Message { get; set; }
+        }
+
+        public class UpdateResponse
+        {
+            public bool Ok { get; set; }
+            public string? Version { get; set; }
+            public string? Url { get; set; }
+            public string? Sha256 { get; set; }
+            public string? Notes { get; set; }
+            public string? Error { get; set; }
+            public string? Details { get; set; }
+        }
+
+        private sealed class UpdateCheckResult
+        {
+            public bool Success { get; init; }
+            public bool IsUpdateAvailable { get; init; }
+            public UpdateResponse? Update { get; init; }
+            public string UserMessage { get; init; } = string.Empty;
+            public string TechnicalDetails { get; init; } = string.Empty;
+        }
+
+        public class ModFileHashEntry
+        {
+            public string FileName { get; set; } = string.Empty;
+            public string Sha256 { get; set; } = string.Empty;
+            public string? Url { get; set; }
+        }
+
+        public class ModHashResponse
+        {
+            public bool Ok { get; set; }
+            public List<ModFileHashEntry> Files { get; set; } = [];
+        }
+
+        public class Game
+        {
+            public string Name { get; set; } = string.Empty;
+        }
+
+        public class GameResponse
+        {
+            public bool Ok { get; set; }
+            public List<Game> Games { get; set; } = [];
+        }
+
+        private sealed class DownloadProgressInfo
+        {
+            public long BytesDownloaded { get; init; }
+            public long? TotalBytes { get; init; }
+            public TimeSpan Elapsed { get; init; }
+            public double BytesPerSecond { get; init; }
+            public string Status { get; init; } = "Download läuft...";
+        }
+
+        private sealed class FileDownloadResult
+        {
+            public long BytesDownloaded { get; init; }
+            public long? TotalBytes { get; init; }
+            public TimeSpan Elapsed { get; init; }
+        }
+
+        public sealed class ServerModRow
+        {
+            public string FileName { get; init; } = string.Empty;
+            public string StatusText { get; init; } = string.Empty;
+            public ModFileHashEntry ServerFile { get; init; } = new();
+        }
+
+        public sealed class LocalModRow
+        {
+            public string FileName { get; init; } = string.Empty;
+            public string FullPath { get; init; } = string.Empty;
+            public string StatusText { get; init; } = string.Empty;
+            public bool CanUpdate { get; init; }
+            public ModFileHashEntry? ServerFile { get; init; }
+        }
+
+        public class GitHubReleaseResponse
+        {
+            public string? Tag_Name { get; set; }
+            public string? Body { get; set; }
+            public List<GitHubAsset> Assets { get; set; } = [];
+        }
+
+        public class GitHubAsset
+        {
+            public string? Name { get; set; }
+            public string? Browser_Download_Url { get; set; }
+        }
+
+        // =========================================================
+        // Constructor / lifecycle
+        // =========================================================
+
         public MainWindow()
         {
             InitializeComponent();
+
+            ServerModsItemsControl.ItemsSource = _serverMods;
+            LocalModsItemsControl.ItemsSource = _localMods;
+            BuildInfoText.Text = $"BBs UMD • v{GetCurrentAppVersion()}";
+
             ShowLoading();
             _ = InitializeAsync();
-        }
-
-        private static HttpClient CreateApiHttpClient()
-        {
-            var client = new HttpClient
-            {
-                Timeout = TimeSpan.FromSeconds(20)
-            };
-
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("BBsUniversalModDownloader/1.0");
-            return client;
-        }
-
-        private static HttpClient CreateDownloadHttpClient()
-        {
-            var client = new HttpClient
-            {
-                Timeout = Timeout.InfiniteTimeSpan
-            };
-
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("BBsUniversalModDownloader/1.0");
-            return client;
-        }
-
-        private async Task InitializeAsync()
-        {
-            try
-            {
-                bool continueStartup = await CheckForUpdatesOnStartupAsync();
-                if (!continueStartup)
-                    return;
-
-                bool connected = await RefreshConnectionStateAsync();
-                if (!connected)
-                    return;
-
-                if (_retryLoopTask == null || _retryLoopTask.IsCompleted)
-                    _retryLoopTask = RetryLoopAsync();
-            }
-            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
-            {
-            }
-            catch (Exception ex)
-            {
-                StopWithError(
-                    "Es konnte keine Verbindung hergestellt werden.\nFehlercode: " + ex.Message,
-                    ex
-                );
-            }
         }
 
         protected override void OnClosed(EventArgs e)
@@ -125,10 +200,36 @@ namespace BBs_Universal_Mod_Downloader
             }
 
             _connectionLock.Dispose();
-            _cts.Dispose();
             _modManagementLock.Dispose();
+            _cts.Dispose();
 
             base.OnClosed(e);
+        }
+
+        // =========================================================
+        // Http / general helpers
+        // =========================================================
+
+        private static HttpClient CreateApiHttpClient()
+        {
+            var client = new HttpClient
+            {
+                Timeout = TimeSpan.FromSeconds(20)
+            };
+
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("BBsUniversalModDownloader/1.0");
+            return client;
+        }
+
+        private static HttpClient CreateDownloadHttpClient()
+        {
+            var client = new HttpClient
+            {
+                Timeout = Timeout.InfiniteTimeSpan
+            };
+
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("BBsUniversalModDownloader/1.0");
+            return client;
         }
 
         private static async Task<string?> GetApiStringAsync(string url, CancellationToken cancellationToken = default)
@@ -162,24 +263,6 @@ namespace BBs_Universal_Mod_Downloader
             return new Version(0, 0, 0, 0);
         }
 
-        private async Task RunExclusiveModActionAsync(Func<Task> action)
-        {
-            if (!await _modManagementLock.WaitAsync(0))
-            {
-                ShowOverlayPopup("Mod-Verwaltung", "Es läuft bereits eine Mod-Aktion.");
-                return;
-            }
-
-            try
-            {
-                await action();
-            }
-            finally
-            {
-                _modManagementLock.Release();
-            }
-        }
-
         private static string FormatBytes(long bytes)
         {
             string[] units = ["B", "KB", "MB", "GB", "TB"];
@@ -203,104 +286,22 @@ namespace BBs_Universal_Mod_Downloader
             return time.ToString(@"mm\:ss");
         }
 
-        public class PingResponse
+        private static List<string> GetLocalModFiles(string modsFolder)
         {
-            public bool Ok { get; set; }
-            public string? Message { get; set; }
+            if (!Directory.Exists(modsFolder))
+                return [];
+
+            return Directory
+                .GetFiles(modsFolder, "pakchunk*.pak", SearchOption.TopDirectoryOnly)
+                .Select(Path.GetFileName)
+                .Where(fileName =>
+                    !string.IsNullOrWhiteSpace(fileName) &&
+                    !fileName.EndsWith("-Windows.pak", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(fileName => fileName, StringComparer.OrdinalIgnoreCase)
+                .Cast<string>()
+                .ToList();
         }
 
-        public class UpdateResponse
-        {
-            public bool Ok { get; set; }
-            public string? Version { get; set; }
-            public string? Url { get; set; }
-            public string? Sha256 { get; set; }
-            public string? Error { get; set; }
-            public string? Details { get; set; }
-        }
-
-        private sealed class UpdateCheckResult
-        {
-            public bool Success { get; init; }
-            public bool IsUpdateAvailable { get; init; }
-            public UpdateResponse? Update { get; init; }
-            public string UserMessage { get; init; } = string.Empty;
-            public string TechnicalDetails { get; init; } = string.Empty;
-        }
-
-        public class ModFileHashEntry
-        {
-            public string FileName { get; set; } = string.Empty;
-            public string Sha256 { get; set; } = string.Empty;
-            public string? Url { get; set; }
-        }
-
-        public class ModHashResponse
-        {
-            public bool Ok { get; set; }
-            public List<ModFileHashEntry> Files { get; set; } = [];
-        }
-
-        public class ModCompareResult
-        {
-            public List<ModFileHashEntry> InstalledCurrent { get; set; } = [];
-            public List<ModFileHashEntry> MissingOnClient { get; set; } = [];
-            public List<ModFileHashEntry> OutdatedOnClient { get; set; } = [];
-            public List<string> ExtraOnClient { get; set; } = [];
-
-            public bool HasServerChanges => MissingOnClient.Count > 0 || OutdatedOnClient.Count > 0;
-            public bool HasLocalExtras => ExtraOnClient.Count > 0;
-            public bool HasChanges => HasServerChanges || HasLocalExtras;
-        }
-
-        public class Game
-        {
-            public string Name { get; set; } = string.Empty;
-        }
-
-        public class GameResponse
-        {
-            public bool Ok { get; set; }
-            public List<Game> Games { get; set; } = [];
-        }
-
-        private sealed class DownloadProgressInfo
-        {
-            public long BytesDownloaded { get; init; }
-            public long? TotalBytes { get; init; }
-            public TimeSpan Elapsed { get; init; }
-            public double BytesPerSecond { get; init; }
-            public string Status { get; init; } = "Download läuft...";
-        }
-
-        private sealed class FileDownloadResult
-        {
-            public long BytesDownloaded { get; init; }
-            public long? TotalBytes { get; init; }
-            public TimeSpan Elapsed { get; init; }
-        }
-
-        private sealed class ModChangeSummary
-        {
-            public int InstalledCount { get; init; }
-            public int UpdatedCount { get; init; }
-            public int RemovedCount { get; init; }
-            public long TotalBytesDownloaded { get; init; }
-            public TimeSpan Elapsed { get; init; }
-        }
-
-        public class GitHubReleaseResponse
-        {
-            public string? Tag_Name { get; set; }
-            public string? Body { get; set; }
-            public List<GitHubAsset> Assets { get; set; } = [];
-        }
-
-        public class GitHubAsset
-        {
-            public string? Name { get; set; }
-            public string? Browser_Download_Url { get; set; }
-        }
         private static string BuildSingleDownloadMessage(string fileName, DownloadProgressInfo info)
         {
             string progressText = info.TotalBytes.HasValue && info.TotalBytes.Value > 0
@@ -335,37 +336,6 @@ namespace BBs_Universal_Mod_Downloader
                 $"Fortschritt: {progressText}{Environment.NewLine}" +
                 $"Geschwindigkeit: {speedText}{Environment.NewLine}" +
                 $"Dauer: {FormatDuration(info.Elapsed)}";
-        }
-
-        private void ShowBusyPopup(string title, string message)
-        {
-            PopupTitleText.Text = title;
-            PopupMessageText.Text = string.IsNullOrWhiteSpace(message)
-                ? "Bitte warten..."
-                : message;
-
-            PopupPrimaryButton.Visibility = Visibility.Collapsed;
-            PopupSecondaryButton.Visibility = Visibility.Collapsed;
-            PopupCloseButton.Visibility = Visibility.Collapsed;
-
-            PopupPrimaryButton.IsEnabled = false;
-            PopupSecondaryButton.IsEnabled = false;
-
-            _popupPrimaryActionAsync = null;
-            _popupSecondaryActionAsync = null;
-            _popupAllowsBackdropClose = false;
-
-            PopupOverlay.Visibility = Visibility.Visible;
-            PopupOverlay.Opacity = 0;
-
-            var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(180));
-            PopupOverlay.BeginAnimation(OpacityProperty, fade);
-        }
-
-        private void UpdateBusyPopup(string title, string message)
-        {
-            PopupTitleText.Text = title;
-            PopupMessageText.Text = message;
         }
 
         private static async Task<FileDownloadResult> DownloadFileWithProgressAsync(
@@ -456,15 +426,222 @@ namespace BBs_Universal_Mod_Downloader
             };
         }
 
+        // =========================================================
+        // Startup / connection
+        // =========================================================
+
+        private async Task InitializeAsync()
+        {
+            try
+            {
+                bool continueStartup = await CheckForUpdatesOnStartupAsync();
+                if (!continueStartup)
+                    return;
+
+                bool connected = await RefreshConnectionStateAsync();
+                if (!connected)
+                    return;
+
+                if (_retryLoopTask == null || _retryLoopTask.IsCompleted)
+                    _retryLoopTask = RetryLoopAsync();
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                StopWithError(
+                    "Es konnte keine Verbindung hergestellt werden.\nFehlercode: " + ex.Message,
+                    ex
+                );
+            }
+        }
+
+        private async Task RetryLoopAsync()
+        {
+            try
+            {
+                while (!_cts.Token.IsCancellationRequested)
+                {
+                    bool ok = await RefreshConnectionStateAsync();
+                    if (!ok)
+                        break;
+
+                    TimeSpan delay = CurrentView == ViewState.Main
+                        ? TimeSpan.FromSeconds(10)
+                        : TimeSpan.FromSeconds(3);
+
+                    await Task.Delay(delay, _cts.Token);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                _retryLoopTask = null;
+            }
+        }
+
+        private async Task<bool> RefreshConnectionStateAsync()
+        {
+            await _connectionLock.WaitAsync(_cts.Token);
+
+            try
+            {
+                string? json = await GetApiStringAsync(
+                    "https://api.betonbroetchen.de/mods/connect.php?action=ping",
+                    _cts.Token
+                );
+
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    return StopWithError(
+                        "Server responded, but no data was returned.",
+                        string.Empty
+                    );
+                }
+
+                PingResponse? ping;
+                try
+                {
+                    ping = JsonConvert.DeserializeObject<PingResponse>(json);
+                }
+                catch (Exception ex)
+                {
+                    return StopWithError(
+                        "Server responded, but the reply was not valid.",
+                        ex
+                    );
+                }
+
+                if (ping?.Ok != true || !string.Equals(ping.Message, "pong", StringComparison.OrdinalIgnoreCase))
+                {
+                    return StopWithError(
+                        "Server responded, but the reply was not valid.",
+                        json
+                    );
+                }
+
+                ServerStatusText.Text = "Online";
+
+                bool wasNotMain = CurrentView != ViewState.Main && CurrentView != ViewState.ModManager;
+
+                if (wasNotMain)
+                {
+                    ShowMain();
+
+                    bool startupOk = await LoadGamesAsync();
+                    if (!startupOk)
+                        return false;
+                }
+
+                return true;
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+                return false;
+            }
+            catch (Exception ex)
+            {
+                return StopWithError(
+                    "Es konnte keine Verbindung hergestellt werden.\nFehlercode: " + ex.Message,
+                    ex
+                );
+            }
+            finally
+            {
+                _connectionLock.Release();
+            }
+        }
+
+        private async Task<bool> LoadGamesAsync()
+        {
+            try
+            {
+                string? json = await GetApiStringAsync(
+                    "https://api.betonbroetchen.de/mods/connect.php?action=games",
+                    _cts.Token
+                );
+
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    return StopWithError(
+                        "Server responded, but no data was returned.",
+                        string.Empty
+                    );
+                }
+
+                GameResponse? data = JsonConvert.DeserializeObject<GameResponse>(json);
+
+                if (data == null || !data.Ok)
+                {
+                    return StopWithError(
+                        "Server responded, but the reply was not valid.",
+                        json
+                    );
+                }
+
+                GameListPanel.Children.Clear();
+
+                if (data.Games.Count == 0)
+                {
+                    GameListPanel.Children.Add(new TextBlock
+                    {
+                        Text = "Keine Spiele gefunden",
+                        Foreground = (Brush)FindResource("TextSubBrush"),
+                        FontSize = 13,
+                        Margin = new Thickness(4, 4, 4, 0)
+                    });
+
+                    GameListContainer.Visibility = Visibility.Visible;
+                    return true;
+                }
+
+                foreach (Game game in data.Games.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
+                {
+                    var btn = new Button
+                    {
+                        Content = game.Name,
+                        Margin = new Thickness(0, 0, 0, 8),
+                        Style = (Style)FindResource("ModernButton"),
+                        Tag = game
+                    };
+
+                    btn.Click += GameButton_Click;
+                    GameListPanel.Children.Add(btn);
+                }
+
+                GameListContainer.Visibility = Visibility.Visible;
+                return true;
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+                return false;
+            }
+            catch (Exception ex)
+            {
+                return StopWithError(
+                    "Es konnte keine Verbindung hergestellt werden.\nFehlercode: " + ex.Message,
+                    ex
+                );
+            }
+        }
+
+        // =========================================================
+        // Update system
+        // =========================================================
+
         private static async Task<UpdateCheckResult> GetUpdateInfoAsync()
         {
-            string requestUrl = $"https://api.github.com/repos/BetonbroetchenDE/BBsUMD/releases/latest";
+            const string requestUrl = "https://api.github.com/repos/BetonbroetchenDE/BBsUMD/releases/latest";
 
             try
             {
                 using var request = new HttpRequestMessage(HttpMethod.Get, requestUrl);
                 request.Headers.UserAgent.ParseAdd("BBsUniversalModDownloader/1.0");
                 request.Headers.Accept.ParseAdd("application/vnd.github+json");
+                request.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
 
                 using var response = await apiClient.SendAsync(request);
                 string body = await response.Content.ReadAsStringAsync();
@@ -479,7 +656,7 @@ namespace BBs_Universal_Mod_Downloader
                     };
                 }
 
-                var release = JsonConvert.DeserializeObject<GitHubReleaseResponse>(body);
+                GitHubReleaseResponse? release = JsonConvert.DeserializeObject<GitHubReleaseResponse>(body);
                 if (release == null || string.IsNullOrWhiteSpace(release.Tag_Name))
                 {
                     return new UpdateCheckResult
@@ -502,9 +679,9 @@ namespace BBs_Universal_Mod_Downloader
                     };
                 }
 
-GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
-    !string.IsNullOrWhiteSpace(a.Name) &&
-    a.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
+                GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
+                    !string.IsNullOrWhiteSpace(a.Name) &&
+                    a.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
 
                 if (exeAsset == null || string.IsNullOrWhiteSpace(exeAsset.Browser_Download_Url))
                 {
@@ -514,6 +691,23 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
                         UserMessage = "Im neuesten GitHub-Release wurde keine EXE gefunden.",
                         TechnicalDetails = body
                     };
+                }
+
+                GitHubAsset? shaAsset = release.Assets.FirstOrDefault(a =>
+                    !string.IsNullOrWhiteSpace(a.Name) &&
+                    a.Name.EndsWith(".exe.sha256", StringComparison.OrdinalIgnoreCase));
+
+                string? sha256 = null;
+                if (shaAsset != null && !string.IsNullOrWhiteSpace(shaAsset.Browser_Download_Url))
+                {
+                    try
+                    {
+                        sha256 = (await downloadClient.GetStringAsync(shaAsset.Browser_Download_Url)).Trim();
+                    }
+                    catch
+                    {
+                        sha256 = null;
+                    }
                 }
 
                 Version localVersion = GetCurrentAppVersion();
@@ -526,7 +720,9 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
                     {
                         Ok = true,
                         Version = remoteVersion.ToString(),
-                        Url = exeAsset.Browser_Download_Url
+                        Url = exeAsset.Browser_Download_Url,
+                        Sha256 = sha256,
+                        Notes = release.Body
                     },
                     TechnicalDetails =
                         $"Lokale Version: {localVersion}{Environment.NewLine}" +
@@ -577,6 +773,13 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
                     $"Aktuell: {GetCurrentAppVersion()}{Environment.NewLine}" +
                     $"Neu: {update.Version}";
 
+                if (!string.IsNullOrWhiteSpace(update.Notes))
+                {
+                    message +=
+                        $"{Environment.NewLine}{Environment.NewLine}" +
+                        $"Hinweise:{Environment.NewLine}{update.Notes}";
+                }
+
                 if (!string.IsNullOrWhiteSpace(update.Url))
                 {
                     message +=
@@ -604,8 +807,6 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
                             );
 
                             await TryUpdateAndRestartAsync(update, _cts.Token);
-
-                            // Falls Shutdown aus irgendeinem Grund nicht greift:
                             tcs.TrySetResult(false);
                         }
                         catch (OperationCanceledException) when (_cts.IsCancellationRequested)
@@ -623,11 +824,11 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
                         }
                     },
                     "Trotzdem fortfahren",
-                    async () =>
+                    () =>
                     {
                         ClosePopup_Click(this, new RoutedEventArgs());
                         tcs.TrySetResult(true);
-                        await Task.CompletedTask;
+                        return Task.CompletedTask;
                     }
                 );
 
@@ -759,366 +960,9 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
             }
         }
 
-        private async Task RetryLoopAsync()
-        {
-            try
-            {
-                while (!_cts.Token.IsCancellationRequested)
-                {
-                    bool ok = await RefreshConnectionStateAsync();
-                    if (!ok)
-                        break;
-
-                    TimeSpan delay = CurrentView == ViewState.Main
-                        ? TimeSpan.FromSeconds(10)
-                        : TimeSpan.FromSeconds(3);
-
-                    await Task.Delay(delay, _cts.Token);
-                }
-            }
-            catch (OperationCanceledException)
-            {
-            }
-            finally
-            {
-                _retryLoopTask = null;
-            }
-        }
-
-        private async Task<bool> RefreshConnectionStateAsync()
-        {
-            await _connectionLock.WaitAsync(_cts.Token);
-
-            try
-            {
-                string? json = await GetApiStringAsync(
-                    "https://api.betonbroetchen.de/mods/connect.php?action=ping",
-                    _cts.Token
-                );
-
-                if (string.IsNullOrWhiteSpace(json))
-                {
-                    return StopWithError(
-                        "Server responded, but no data was returned.",
-                        string.Empty
-                    );
-                }
-
-                PingResponse? ping;
-                try
-                {
-                    ping = JsonConvert.DeserializeObject<PingResponse>(json);
-                }
-                catch (Exception ex)
-                {
-                    return StopWithError(
-                        "Server responded, but the reply was not valid.",
-                        ex
-                    );
-                }
-
-                if (ping?.Ok != true || !string.Equals(ping.Message, "pong", StringComparison.OrdinalIgnoreCase))
-                {
-                    return StopWithError(
-                        "Server responded, but the reply was not valid.",
-                        json
-                    );
-                }
-
-                bool wasNotMain = CurrentView != ViewState.Main;
-
-                if (wasNotMain)
-                {
-                    ShowMain();
-
-                    bool startupOk = await StartupStuff();
-                    if (!startupOk)
-                        return false;
-                }
-
-                return true;
-            }
-            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
-            {
-                return false;
-            }
-            catch (Exception ex)
-            {
-                return StopWithError(
-                    "Es konnte keine Verbindung hergestellt werden.\nFehlercode: " + ex.Message,
-                    ex
-                );
-            }
-            finally
-            {
-                _connectionLock.Release();
-            }
-        }
-
-        private async Task<ModChangeSummary> ApplyServerModsAsync(
-            string gameName,
-            List<ModFileHashEntry> filesToApply,
-            CancellationToken cancellationToken = default)
-        {
-            string? modsFolder = GetModsFolder(gameName);
-            if (string.IsNullOrWhiteSpace(modsFolder))
-                throw new InvalidOperationException("Kein Mod-Ordner für dieses Spiel gefunden.");
-
-            Directory.CreateDirectory(modsFolder);
-
-            Stopwatch totalSw = Stopwatch.StartNew();
-            long totalBytesDownloaded = 0;
-            int installedCount = 0;
-            int updatedCount = 0;
-
-            for (int i = 0; i < filesToApply.Count; i++)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                ModFileHashEntry file = filesToApply[i];
-
-                if (string.IsNullOrWhiteSpace(file.Url))
-                    throw new InvalidOperationException($"Für die Datei '{file.FileName}' wurde keine Download-URL geliefert.");
-
-                string targetPath = Path.Combine(modsFolder, file.FileName);
-                string tempPath = targetPath + ".download";
-                bool existedBefore = File.Exists(targetPath);
-
-                try
-                {
-                    int fileIndex = i + 1;
-                    string fileName = file.FileName;
-
-                    UpdateBusyPopup(
-                        "Mods werden angewendet",
-                        $"Warte auf Serverantwort...{Environment.NewLine}{Environment.NewLine}" +
-                        $"Datei {fileIndex} von {filesToApply.Count}: {fileName}"
-                    );
-
-                    using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
-                    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
-
-                    var progress = new Progress<DownloadProgressInfo>(info =>
-                    {
-                        UpdateBusyPopup(
-                            "Mods werden angewendet",
-                            BuildModDownloadMessage(fileIndex, filesToApply.Count, fileName, info)
-                        );
-                    });
-
-                    FileDownloadResult result;
-
-                    try
-                    {
-                        result = await DownloadFileWithProgressAsync(
-                            file.Url,
-                            tempPath,
-                            progress,
-                            linkedCts.Token
-                        );
-                    }
-                    catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
-                    {
-                        throw new TimeoutException($"Der Download der Datei '{file.FileName}' hat das Zeitlimit von 15 Minuten überschritten.");
-                    }
-
-                    UpdateBusyPopup(
-                        "Mods werden angewendet",
-                        $"Download abgeschlossen.{Environment.NewLine}{Environment.NewLine}" +
-                        $"Datei {fileIndex} von {filesToApply.Count}: {fileName}{Environment.NewLine}" +
-                        $"Heruntergeladen: {FormatBytes(result.BytesDownloaded)}{Environment.NewLine}" +
-                        $"Dauer: {FormatDuration(result.Elapsed)}{Environment.NewLine}{Environment.NewLine}" +
-                        $"Prüfe SHA-256..."
-                    );
-
-                    string downloadedHash = await ComputeSha256Async(tempPath, cancellationToken);
-
-                    if (!string.Equals(downloadedHash, file.Sha256, StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidOperationException($"Die Hash-Prüfung ist fehlgeschlagen: {file.FileName}");
-
-                    File.Move(tempPath, targetPath, overwrite: true);
-                    totalBytesDownloaded += result.BytesDownloaded;
-
-                    if (existedBefore)
-                        updatedCount++;
-                    else
-                        installedCount++;
-                }
-                catch
-                {
-                    if (File.Exists(tempPath))
-                    {
-                        try
-                        {
-                            File.Delete(tempPath);
-                        }
-                        catch
-                        {
-                        }
-                    }
-
-                    throw;
-                }
-            }
-
-            return new ModChangeSummary
-            {
-                InstalledCount = installedCount,
-                UpdatedCount = updatedCount,
-                RemovedCount = 0,
-                TotalBytesDownloaded = totalBytesDownloaded,
-                Elapsed = totalSw.Elapsed
-            };
-        }
-
-        private async Task<ModChangeSummary> RemoveLocalModsAsync(
-            List<string> filesToRemove,
-            CancellationToken cancellationToken = default)
-        {
-            if (string.IsNullOrWhiteSpace(_selectedGameModFolder) || !Directory.Exists(_selectedGameModFolder))
-                throw new InvalidOperationException("Kein Mod-Ordner für dieses Spiel gefunden.");
-
-            Stopwatch sw = Stopwatch.StartNew();
-            int removedCount = 0;
-
-            await Task.Run(() =>
-            {
-                foreach (string fileName in filesToRemove)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-
-                    string fullPath = Path.Combine(_selectedGameModFolder, fileName);
-                    if (!File.Exists(fullPath))
-                        continue;
-
-                    File.Delete(fullPath);
-                    removedCount++;
-                }
-            }, cancellationToken);
-
-            return new ModChangeSummary
-            {
-                InstalledCount = 0,
-                UpdatedCount = 0,
-                RemovedCount = removedCount,
-                TotalBytesDownloaded = 0,
-                Elapsed = sw.Elapsed
-            };
-        }
-
-        private static string BuildModOverviewMessage(ModCompareResult compare)
-        {
-            var lines = new List<string>
-    {
-        $"Aktuell installiert: {compare.InstalledCurrent.Count}",
-        $"Fehlt lokal: {compare.MissingOnClient.Count}",
-        $"Veraltet / anders: {compare.OutdatedOnClient.Count}",
-        $"Nur lokal vorhanden: {compare.ExtraOnClient.Count}"
-    };
-
-            if (compare.InstalledCurrent.Count > 0)
-            {
-                lines.Add(string.Empty);
-                lines.Add("Aktuell installiert:");
-                lines.AddRange(compare.InstalledCurrent.Select(x => $"  = {x.FileName}"));
-            }
-
-            if (compare.MissingOnClient.Count > 0)
-            {
-                lines.Add(string.Empty);
-                lines.Add("Fehlt lokal:");
-                lines.AddRange(compare.MissingOnClient.Select(x => $"  + {x.FileName}"));
-            }
-
-            if (compare.OutdatedOnClient.Count > 0)
-            {
-                lines.Add(string.Empty);
-                lines.Add("Veraltet / anders:");
-                lines.AddRange(compare.OutdatedOnClient.Select(x => $"  * {x.FileName}"));
-            }
-
-            if (compare.ExtraOnClient.Count > 0)
-            {
-                lines.Add(string.Empty);
-                lines.Add("Nur lokal vorhanden:");
-                lines.AddRange(compare.ExtraOnClient.Select(x => $"  - {x}"));
-            }
-
-            return string.Join(Environment.NewLine, lines);
-        }
-
-        private async Task<bool> StartupStuff()
-        {
-            try
-            {
-                string? json = await GetApiStringAsync(
-                    "https://api.betonbroetchen.de/mods/connect.php?action=games",
-                    _cts.Token
-                );
-
-                if (string.IsNullOrWhiteSpace(json))
-                {
-                    return StopWithError(
-                        "Server responded, but no data was returned.",
-                        string.Empty
-                    );
-                }
-
-                GameResponse? data = JsonConvert.DeserializeObject<GameResponse>(json);
-
-                if (data == null || !data.Ok)
-                {
-                    return StopWithError(
-                        "Server responded, but the reply was not valid.",
-                        json
-                    );
-                }
-
-                GameListPanel.Children.Clear();
-
-                if (data.Games.Count == 0)
-                {
-                    GameListPanel.Children.Add(new TextBlock
-                    {
-                        Text = "Keine Spiele gefunden",
-                        Foreground = (Brush)FindResource("TextSubBrush"),
-                        FontSize = 13,
-                        Margin = new Thickness(4, 4, 4, 0)
-                    });
-
-                    GameListContainer.Visibility = Visibility.Visible;
-                    return true;
-                }
-
-                foreach (Game game in data.Games.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase))
-                {
-                    var btn = new Button
-                    {
-                        Content = game.Name,
-                        Margin = new Thickness(0, 0, 0, 8),
-                        Style = (Style)FindResource("ModernButton"),
-                        Tag = game
-                    };
-
-                    btn.Click += GameButton_Click;
-                    GameListPanel.Children.Add(btn);
-                }
-
-                GameListContainer.Visibility = Visibility.Visible;
-                return true;
-            }
-            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
-            {
-                return false;
-            }
-            catch (Exception ex)
-            {
-                return StopWithError(
-                    "Es konnte keine Verbindung hergestellt werden.\nFehlercode: " + ex.Message,
-                    ex
-                );
-            }
-        }
+        // =========================================================
+        // Steam / selected game
+        // =========================================================
 
         private static string? GetModsFolder(string gameName)
         {
@@ -1133,133 +977,10 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
             };
         }
 
-        private static async Task<ModCompareResult?> CompareModsAsync(string gameName, CancellationToken cancellationToken = default)
-        {
-            string? modsFolder = GetModsFolder(gameName);
-            if (string.IsNullOrWhiteSpace(modsFolder) || !Directory.Exists(modsFolder))
-                return null;
-
-            string? json = await GetApiStringAsync(
-                $"https://api.betonbroetchen.de/mods/connect.php?action=mod_hashes&game={Uri.EscapeDataString(gameName)}",
-                cancellationToken
-            );
-
-            if (string.IsNullOrWhiteSpace(json))
-                return null;
-
-            ModHashResponse? serverData = JsonConvert.DeserializeObject<ModHashResponse>(json);
-            if (serverData == null || !serverData.Ok)
-                return null;
-
-            var result = new ModCompareResult();
-
-            var serverLookup = serverData.Files.ToDictionary(
-                x => x.FileName,
-                x => x,
-                StringComparer.OrdinalIgnoreCase
-            );
-
-            var localFiles = Directory
-                .GetFiles(modsFolder, "pakchunk*.pak", SearchOption.TopDirectoryOnly)
-                .Where(path =>
-                {
-                    string? fileName = Path.GetFileName(path);
-                    return !string.IsNullOrWhiteSpace(fileName) &&
-                           !fileName.EndsWith("-Windows.pak", StringComparison.OrdinalIgnoreCase);
-                })
-                .ToList();
-
-            var localLookup = localFiles.ToDictionary(
-                path => Path.GetFileName(path)!,
-                path => path,
-                StringComparer.OrdinalIgnoreCase
-            );
-
-            foreach (ModFileHashEntry serverFile in serverData.Files.OrderBy(x => x.FileName, StringComparer.OrdinalIgnoreCase))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                if (!localLookup.TryGetValue(serverFile.FileName, out string? localPath))
-                {
-                    result.MissingOnClient.Add(serverFile);
-                    continue;
-                }
-
-                string localHash = await ComputeSha256Async(localPath, cancellationToken);
-
-                if (string.Equals(localHash, serverFile.Sha256, StringComparison.OrdinalIgnoreCase))
-                    result.InstalledCurrent.Add(serverFile);
-                else
-                    result.OutdatedOnClient.Add(serverFile);
-            }
-
-            foreach (string local in localLookup.Keys.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
-            {
-                if (!serverLookup.ContainsKey(local))
-                    result.ExtraOnClient.Add(local);
-            }
-
-            return result;
-        }
-
-        private void ShowLoading() => SwitchView(LoadingView, ViewState.Loading);
-
-        private void ShowError(string message, string fullError)
-        {
-            ErrorMessageText.Text = message;
-            FullErrorText.Text = fullError;
-
-            FullErrorPanel.Visibility = Visibility.Collapsed;
-            ShowFullErrorButton.Content = "Vollständigen Fehler anzeigen";
-
-            SwitchView(ErrorView, ViewState.Error);
-        }
-
-        private void ClosePopupImmediate()
-        {
-            PopupOverlay.BeginAnimation(OpacityProperty, null);
-            PopupOverlay.Visibility = Visibility.Collapsed;
-
-            _popupPrimaryActionAsync = null;
-            _popupSecondaryActionAsync = null;
-            _popupAllowsBackdropClose = true;
-        }
-
-        private bool StopWithError(string userMessage, string? technicalDetails = null)
-        {
-            ClosePopupImmediate();
-            ShowError(userMessage, string.IsNullOrWhiteSpace(technicalDetails) ? userMessage : technicalDetails);
-            return false;
-        }
-
-        private bool StopWithError(string userMessage, Exception ex)
-        {
-            return StopWithError(userMessage, ex.ToString());
-        }
-
-        private void ShowMain() => SwitchView(MainView, ViewState.Main);
-
-        private void SwitchView(UIElement target, ViewState state)
-        {
-            foreach (UIElement element in new[] { LoadingView, ErrorView, MainView })
-            {
-                element.Visibility = Visibility.Collapsed;
-                element.Opacity = 0;
-            }
-
-            target.Visibility = Visibility.Visible;
-
-            var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(300));
-            target.BeginAnimation(OpacityProperty, fade);
-
-            CurrentView = state;
-        }
-
         private void CheckGameState(string name)
         {
             _selectedGameInstalled = false;
             _selectedGameModFolder = null;
-            _selectedGameModList = string.Empty;
 
             if (!SteamHelper.IsGameInstalled(name))
             {
@@ -1271,335 +992,373 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
             SelectedGameInstallState.Text = "Das Spiel ist installiert.";
 
             string? modsFolder = GetModsFolder(name);
-            if (string.IsNullOrWhiteSpace(modsFolder) || !Directory.Exists(modsFolder))
+            if (string.IsNullOrWhiteSpace(modsFolder))
                 return;
 
             _selectedGameModFolder = modsFolder;
-
-            _selectedGameModList = string.Join(
-                Environment.NewLine,
-                Directory
-                    .GetFiles(modsFolder, "pakchunk*.pak", SearchOption.TopDirectoryOnly)
-                    .Select(Path.GetFileName)
-                    .Where(fileName =>
-                        !string.IsNullOrWhiteSpace(fileName) &&
-                        !fileName.EndsWith("-Windows.pak", StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(fileName => fileName, StringComparer.OrdinalIgnoreCase)
-            );
         }
 
-        private void GameButton_Click(object sender, RoutedEventArgs e)
+        // =========================================================
+        // Mod manager view logic
+        // =========================================================
+
+        private async Task RunExclusiveModActionAsync(Func<Task> action)
         {
+            if (!await _modManagementLock.WaitAsync(0))
+            {
+                ShowOverlayPopup("Mod-Verwaltung", "Es läuft bereits eine Mod-Aktion.");
+                return;
+            }
+
             try
             {
-                if (sender is Button btn && btn.Tag is Game game)
-                {
-                    _selectedGameName = game.Name;
-                    SelectedGameTitle.Text = game.Name;
-
-                    CheckGameState(game.Name);
-
-                    GameListView.Visibility = Visibility.Collapsed;
-                    GameMenuView.Visibility = Visibility.Visible;
-                }
+                await action();
             }
-            catch (Exception ex)
+            finally
             {
-                ShowOverlayPopup(
-                    "Fehler",
-                    $"Fehler beim Öffnen des Spiels:{Environment.NewLine}{Environment.NewLine}{ex}"
-                );
+                _modManagementLock.Release();
             }
         }
 
-        private void BackToGameList_Click(object sender, RoutedEventArgs e)
+        private void SetModManagerInteractiveState(bool enabled)
         {
-            GameMenuView.Visibility = Visibility.Collapsed;
-            GameListView.Visibility = Visibility.Visible;
+            ModManagerInteractivePanel.IsEnabled = enabled;
+            RefreshModManagerButton.IsEnabled = enabled;
+            BackFromModManagerButton.IsEnabled = enabled;
         }
 
-        private void OpenModFolder_Click(object sender, RoutedEventArgs e)
+        private void ShowModActionMessage(string title, string fileName, string info, bool indeterminate = true)
         {
+            ModActionTitleText.Text = title;
+            ModActionFileText.Text = fileName;
+            ModActionInfoText.Text = string.IsNullOrWhiteSpace(info) ? "Bitte warten..." : info;
+            ModActionProgressBar.IsIndeterminate = indeterminate;
+
+            if (!indeterminate)
+                ModActionProgressBar.Value = 0;
+
+            ModActionOverlay.Visibility = Visibility.Visible;
+        }
+
+        private void UpdateModActionProgress(string title, string fileName, DownloadProgressInfo info)
+        {
+            ModActionTitleText.Text = title;
+            ModActionFileText.Text = fileName;
+
+            bool hasTotal = info.TotalBytes.HasValue && info.TotalBytes.Value > 0;
+
+            if (hasTotal)
+            {
+                ModActionProgressBar.IsIndeterminate = false;
+                ModActionProgressBar.Value = (double)info.BytesDownloaded / info.TotalBytes!.Value * 100d;
+            }
+            else
+            {
+                ModActionProgressBar.IsIndeterminate = true;
+            }
+
+            string progressText = hasTotal
+                ? $"{FormatBytes(info.BytesDownloaded)} / {FormatBytes(info.TotalBytes!.Value)} ({(double)info.BytesDownloaded / info.TotalBytes.Value:P1})"
+                : $"{FormatBytes(info.BytesDownloaded)} / Gesamtgröße unbekannt";
+
+            string speedText = info.BytesPerSecond > 0
+                ? $"{FormatBytes((long)info.BytesPerSecond)}/s"
+                : "-";
+
+            ModActionInfoText.Text =
+                $"{progressText}{Environment.NewLine}" +
+                $"Geschwindigkeit: {speedText}{Environment.NewLine}" +
+                $"Dauer: {FormatDuration(info.Elapsed)}";
+        }
+
+        private void HideModActionOverlay()
+        {
+            ModActionOverlay.Visibility = Visibility.Collapsed;
+            ModActionProgressBar.IsIndeterminate = true;
+            ModActionProgressBar.Value = 0;
+            ModActionTitleText.Text = "Aktion läuft";
+            ModActionFileText.Text = "Datei";
+            ModActionInfoText.Text = "Bitte warten...";
+        }
+
+        private async Task LoadModManagerAsync()
+        {
+            if (string.IsNullOrWhiteSpace(_selectedGameModFolder))
+                throw new InvalidOperationException("Kein Mod-Ordner für dieses Spiel gefunden.");
+
+            SetModManagerInteractiveState(false);
+            HideModActionOverlay();
+
+            ModManagerTitleText.Text = $"Mods verwalten - {_selectedGameName}";
+            ModManagerSubtitleText.Text = _selectedGameModFolder;
+            ModManagerStatusText.Text = "Lade Mod-Status...";
+
+            ServerModsSummaryText.Text = "Lade Server-Mods...";
+            LocalModsSummaryText.Text = "Lade lokale Mods...";
+            ServerModsEmptyText.Visibility = Visibility.Collapsed;
+            LocalModsEmptyText.Visibility = Visibility.Collapsed;
+
             try
             {
-                if (!string.IsNullOrWhiteSpace(_selectedGameModFolder) && Directory.Exists(_selectedGameModFolder))
+                Directory.CreateDirectory(_selectedGameModFolder);
+
+                _serverMods.Clear();
+                _localMods.Clear();
+
+                List<string> localFiles = GetLocalModFiles(_selectedGameModFolder);
+
+                bool serverAvailable = false;
+                string? serverError = null;
+                ModHashResponse? serverData = null;
+
+                try
                 {
-                    Process.Start(new ProcessStartInfo
+                    string? json = await GetApiStringAsync(
+                        $"https://api.betonbroetchen.de/mods/connect.php?action=mod_hashes&game={Uri.EscapeDataString(_selectedGameName)}",
+                        _cts.Token
+                    );
+
+                    if (string.IsNullOrWhiteSpace(json))
                     {
-                        FileName = "explorer.exe",
-                        Arguments = $"\"{_selectedGameModFolder}\"",
-                        UseShellExecute = true
-                    });
+                        serverError = "Server responded, but no data was returned.";
+                    }
+                    else
+                    {
+                        serverData = JsonConvert.DeserializeObject<ModHashResponse>(json);
+
+                        if (serverData == null || !serverData.Ok)
+                            serverError = "Server responded, but the reply was not valid.";
+                        else
+                            serverAvailable = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    serverError = ex.Message;
+                }
+
+                if (serverAvailable && serverData != null)
+                {
+                    var serverLookup = serverData.Files.ToDictionary(
+                        x => x.FileName,
+                        x => x,
+                        StringComparer.OrdinalIgnoreCase
+                    );
+
+                    foreach (ModFileHashEntry serverFile in serverData.Files.OrderBy(x => x.FileName, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (!localFiles.Contains(serverFile.FileName, StringComparer.OrdinalIgnoreCase))
+                        {
+                            _serverMods.Add(new ServerModRow
+                            {
+                                FileName = serverFile.FileName,
+                                StatusText = "Nicht lokal installiert.",
+                                ServerFile = serverFile
+                            });
+                        }
+                    }
+
+                    foreach (string localFile in localFiles)
+                    {
+                        string fullPath = Path.Combine(_selectedGameModFolder, localFile);
+
+                        if (serverLookup.TryGetValue(localFile, out ModFileHashEntry? serverFile))
+                        {
+                            string localHash = await ComputeSha256Async(fullPath, _cts.Token);
+                            bool isCurrent = string.Equals(localHash, serverFile.Sha256, StringComparison.OrdinalIgnoreCase);
+
+                            _localMods.Add(new LocalModRow
+                            {
+                                FileName = localFile,
+                                FullPath = fullPath,
+                                CanUpdate = !isCurrent && !string.IsNullOrWhiteSpace(serverFile.Url),
+                                ServerFile = serverFile,
+                                StatusText = isCurrent
+                                    ? "Server-Version entspricht der lokalen Version."
+                                    : "Auf dem Server ist eine andere Version verfügbar."
+                            });
+                        }
+                        else
+                        {
+                            _localMods.Add(new LocalModRow
+                            {
+                                FileName = localFile,
+                                FullPath = fullPath,
+                                CanUpdate = false,
+                                ServerFile = null,
+                                StatusText = "Nicht auf dem Server gefunden."
+                            });
+                        }
+                    }
+
+                    ServerModsSummaryText.Text = $"{_serverMods.Count} Mod(s) können heruntergeladen werden.";
+                    LocalModsSummaryText.Text = $"{_localMods.Count} lokal installierte Mod(s).";
+
+                    ServerModsEmptyText.Text = "Keine Server-Mods gefunden, die lokal fehlen.";
                 }
                 else
                 {
-                    StopWithError("Kein Mod-Ordner für dieses Spiel gefunden.");
+                    foreach (string localFile in localFiles)
+                    {
+                        _localMods.Add(new LocalModRow
+                        {
+                            FileName = localFile,
+                            FullPath = Path.Combine(_selectedGameModFolder, localFile),
+                            CanUpdate = false,
+                            ServerFile = null,
+                            StatusText = string.IsNullOrWhiteSpace(serverError)
+                                ? "Serverstatus unbekannt."
+                                : $"Serverstatus unbekannt: {serverError}"
+                        });
+                    }
+
+                    ServerModsSummaryText.Text = "Serverstatus unbekannt.";
+                    LocalModsSummaryText.Text = $"{_localMods.Count} lokal installierte Mod(s).";
+                    ServerModsEmptyText.Text = string.IsNullOrWhiteSpace(serverError)
+                        ? "Serverstatus konnte nicht geladen werden."
+                        : $"Serverstatus konnte nicht geladen werden: {serverError}";
                 }
+
+                ServerModsEmptyText.Visibility = _serverMods.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+                LocalModsEmptyText.Visibility = _localMods.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+                ModManagerStatusText.Text = "Bereit.";
             }
-            catch (Exception ex)
+            finally
             {
-                StopWithError("Der Mod-Ordner konnte nicht geöffnet werden.", ex);
-            }
-        }
-
-        private async Task RemoveExtrasAsync(ModCompareResult compare)
-        {
-            await RunExclusiveModActionAsync(async () =>
-            {
-                ShowBusyPopup("Lokale Extras werden gelöscht", "Dateien werden entfernt...");
-
-                ModChangeSummary summary = await RemoveLocalModsAsync(compare.ExtraOnClient, _cts.Token);
-
-                CheckGameState(_selectedGameName);
-
-                ShowOverlayPopup(
-                    "Deinstallation abgeschlossen",
-                    $"Deinstalliert: {summary.RemovedCount}{Environment.NewLine}" +
-                    $"Dauer: {FormatDuration(summary.Elapsed)}"
-                );
-            });
-        }
-
-        private async Task ApplyOnlyOutdatedAsync(ModCompareResult compare)
-        {
-            await RunExclusiveModActionAsync(async () =>
-            {
-                ShowBusyPopup("Veraltete Mods werden geupdatet", "Download wird vorbereitet...");
-
-                ModChangeSummary summary = await ApplyServerModsAsync(_selectedGameName, compare.OutdatedOnClient, _cts.Token);
-
-                CheckGameState(_selectedGameName);
-
-                ShowOverlayPopup(
-                    "Update abgeschlossen",
-                    $"Geupdatet: {summary.UpdatedCount}{Environment.NewLine}" +
-                    $"Heruntergeladen: {FormatBytes(summary.TotalBytesDownloaded)}{Environment.NewLine}" +
-                    $"Dauer: {FormatDuration(summary.Elapsed)}"
-                );
-            });
-        }
-
-        private async Task ApplyOnlyMissingAsync(ModCompareResult compare)
-        {
-            await RunExclusiveModActionAsync(async () =>
-            {
-                ShowBusyPopup("Fehlende Mods werden installiert", "Download wird vorbereitet...");
-
-                ModChangeSummary summary = await ApplyServerModsAsync(_selectedGameName, compare.MissingOnClient, _cts.Token);
-
-                CheckGameState(_selectedGameName);
-
-                ShowOverlayPopup(
-                    "Installation abgeschlossen",
-                    $"Installiert: {summary.InstalledCount}{Environment.NewLine}" +
-                    $"Heruntergeladen: {FormatBytes(summary.TotalBytesDownloaded)}{Environment.NewLine}" +
-                    $"Dauer: {FormatDuration(summary.Elapsed)}"
-                );
-            });
-        }
-
-        private async Task SynchronizeAllModsAsync(ModCompareResult compare)
-        {
-            await RunExclusiveModActionAsync(async () =>
-            {
-                ShowBusyPopup("Mods werden synchronisiert", "Synchronisierung wird vorbereitet...");
-
-                ModChangeSummary total = new();
-
-                if (compare.HasServerChanges)
-                    total = await ApplyServerModsAsync(_selectedGameName, [.. compare.MissingOnClient, .. compare.OutdatedOnClient], _cts.Token);
-
-                ModChangeSummary removeSummary = new();
-                if (compare.HasLocalExtras)
-                    removeSummary = await RemoveLocalModsAsync(compare.ExtraOnClient, _cts.Token);
-
-                CheckGameState(_selectedGameName);
-
-                ShowOverlayPopup(
-                    "Synchronisierung abgeschlossen",
-                    $"Installiert: {total.InstalledCount}{Environment.NewLine}" +
-                    $"Geupdatet: {total.UpdatedCount}{Environment.NewLine}" +
-                    $"Deinstalliert: {removeSummary.RemovedCount}{Environment.NewLine}" +
-                    $"Heruntergeladen: {FormatBytes(total.TotalBytesDownloaded)}{Environment.NewLine}" +
-                    $"Dauer: {FormatDuration(total.Elapsed + removeSummary.Elapsed)}"
-                );
-            });
-        }
-
-        private void ShowServerApplyActions(ModCompareResult compare)
-        {
-            if (compare.MissingOnClient.Count > 0 && compare.OutdatedOnClient.Count > 0)
-            {
-                ShowDecisionPopup(
-                    "Installieren / Updaten",
-                    $"Fehlend: {compare.MissingOnClient.Count}{Environment.NewLine}Veraltet: {compare.OutdatedOnClient.Count}",
-                    "Fehlende installieren",
-                    async () => await ApplyOnlyMissingAsync(compare),
-                    "Veraltete updaten",
-                    async () => await ApplyOnlyOutdatedAsync(compare)
-                );
-                return;
-            }
-
-            if (compare.MissingOnClient.Count > 0)
-            {
-                ShowDecisionPopup(
-                    "Fehlende Mods installieren",
-                    $"Fehlend: {compare.MissingOnClient.Count}",
-                    "Installieren",
-                    async () => await ApplyOnlyMissingAsync(compare),
-                    "Schließen",
-                    async () =>
-                    {
-                        ClosePopup_Click(this, new RoutedEventArgs());
-                        await Task.CompletedTask;
-                    }
-                );
-                return;
-            }
-
-            if (compare.OutdatedOnClient.Count > 0)
-            {
-                ShowDecisionPopup(
-                    "Veraltete Mods updaten",
-                    $"Veraltet: {compare.OutdatedOnClient.Count}",
-                    "Updaten",
-                    async () => await ApplyOnlyOutdatedAsync(compare),
-                    "Schließen",
-                    async () =>
-                    {
-                        ClosePopup_Click(this, new RoutedEventArgs());
-                        await Task.CompletedTask;
-                    }
-                );
+                SetModManagerInteractiveState(true);
             }
         }
 
-        private void ShowModManagementActions(ModCompareResult compare)
+        private async Task ApplyServerModAsync(ModFileHashEntry file, string actionTitle)
         {
-            if (compare.HasServerChanges && compare.HasLocalExtras)
-            {
-                ShowDecisionPopup(
-                    "Weitere Mod-Aktionen",
-                    "Wähle die Richtung der Änderung.",
-                    "Installieren / Updaten",
-                    async () =>
-                    {
-                        ShowServerApplyActions(compare);
-                        await Task.CompletedTask;
-                    },
-                    "Deinstallieren",
-                    async () => await RemoveExtrasAsync(compare)
-                );
-                return;
-            }
+            if (string.IsNullOrWhiteSpace(_selectedGameModFolder))
+                throw new InvalidOperationException("Kein Mod-Ordner für dieses Spiel gefunden.");
 
-            if (compare.HasServerChanges)
-            {
-                ShowServerApplyActions(compare);
-                return;
-            }
+            if (string.IsNullOrWhiteSpace(file.Url))
+                throw new InvalidOperationException($"Für die Datei '{file.FileName}' wurde keine Download-URL geliefert.");
 
-            if (compare.HasLocalExtras)
-            {
-                ShowDecisionPopup(
-                    "Lokale Extras löschen",
-                    $"Nur lokal vorhanden: {compare.ExtraOnClient.Count}",
-                    "Deinstallieren",
-                    async () => await RemoveExtrasAsync(compare),
-                    "Schließen",
-                    async () =>
-                    {
-                        ClosePopup_Click(this, new RoutedEventArgs());
-                        await Task.CompletedTask;
-                    }
-                );
-            }
-        }
+            Directory.CreateDirectory(_selectedGameModFolder);
 
-        private void ShowModManagementOverview(ModCompareResult compare)
-        {
-            string message = BuildModOverviewMessage(compare);
+            string targetPath = Path.Combine(_selectedGameModFolder, file.FileName);
+            string tempPath = targetPath + ".download";
 
-            if (!compare.HasChanges)
-            {
-                ShowOverlayPopup("Mods verwalten", message + $"{Environment.NewLine}{Environment.NewLine}Alle Mods sind synchron.");
-                return;
-            }
-
-            ShowDecisionPopup(
-                "Mods verwalten",
-                message,
-                "Alles synchronisieren",
-                async () => await SynchronizeAllModsAsync(compare),
-                "Weitere Aktionen",
-                async () =>
-                {
-                    ShowModManagementActions(compare);
-                    await Task.CompletedTask;
-                }
-            );
-        }
-
-        private async void ManageMods_Click(object sender, RoutedEventArgs e)
-        {
             try
             {
-                await RunExclusiveModActionAsync(async () =>
+                ShowModActionMessage(actionTitle, file.FileName, "Download wird vorbereitet...", true);
+
+                using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, timeoutCts.Token);
+
+                var progress = new Progress<DownloadProgressInfo>(info =>
                 {
-                    if (!_selectedGameInstalled)
-                    {
-                        StopWithError("Das Spiel ist nicht installiert.");
-                        return;
-                    }
-
-                    if (string.IsNullOrWhiteSpace(_selectedGameModFolder) || !Directory.Exists(_selectedGameModFolder))
-                    {
-                        StopWithError("Kein Mod-Ordner für dieses Spiel gefunden.");
-                        return;
-                    }
-
-                    ShowBusyPopup("Mods verwalten", "Lade Mod-Status vom Server...");
-
-                    ModCompareResult? compare = await CompareModsAsync(_selectedGameName, _cts.Token);
-
-                    if (compare == null)
-                    {
-                        StopWithError("Die Mod-Daten vom Server konnten nicht geladen werden.");
-                        return;
-                    }
-
-                    ShowModManagementOverview(compare);
+                    UpdateModActionProgress(actionTitle, file.FileName, info);
                 });
+
+                FileDownloadResult result;
+
+                try
+                {
+                    result = await DownloadFileWithProgressAsync(
+                        file.Url,
+                        tempPath,
+                        progress,
+                        linkedCts.Token
+                    );
+                }
+                catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !_cts.IsCancellationRequested)
+                {
+                    throw new TimeoutException($"Der Download der Datei '{file.FileName}' hat das Zeitlimit von 15 Minuten überschritten.");
+                }
+
+                ShowModActionMessage(
+                    actionTitle,
+                    file.FileName,
+                    $"Download abgeschlossen.{Environment.NewLine}" +
+                    $"Heruntergeladen: {FormatBytes(result.BytesDownloaded)}{Environment.NewLine}" +
+                    $"Dauer: {FormatDuration(result.Elapsed)}{Environment.NewLine}{Environment.NewLine}" +
+                    $"Prüfe SHA-256...",
+                    true
+                );
+
+                string downloadedHash = await ComputeSha256Async(tempPath, _cts.Token);
+
+                if (!string.Equals(downloadedHash, file.Sha256, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException($"Die Hash-Prüfung ist fehlgeschlagen: {file.FileName}");
+
+                File.Move(tempPath, targetPath, overwrite: true);
             }
-            catch (Exception ex)
+            catch
             {
-                StopWithError("Unerwarteter Fehler bei der Mod-Verwaltung.", ex);
+                if (File.Exists(tempPath))
+                {
+                    try
+                    {
+                        File.Delete(tempPath);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                throw;
             }
         }
 
-        private void ShowMods_Click(object sender, RoutedEventArgs e)
+        private async Task RemoveLocalModAsync(LocalModRow row)
         {
-            try
-            {
-                if (!_selectedGameInstalled)
-                {
-                    StopWithError("Das Spiel ist nicht installiert.");
-                    return;
-                }
+            if (string.IsNullOrWhiteSpace(_selectedGameModFolder))
+                throw new InvalidOperationException("Kein Mod-Ordner für dieses Spiel gefunden.");
 
-                if (string.IsNullOrWhiteSpace(_selectedGameModList))
-                {
-                    StopWithError($"Für {_selectedGameName} wurden keine Mods gefunden.");
-                    return;
-                }
+            Directory.CreateDirectory(_selectedGameModFolder);
 
-                ShowOverlayPopup($"Mods von {_selectedGameName}", _selectedGameModList);
-            }
-            catch (Exception ex)
+            ShowModActionMessage(
+                "Mod wird deinstalliert",
+                row.FileName,
+                "Datei wird entfernt...",
+                true
+            );
+
+            await Task.Run(() =>
             {
-                StopWithError("Unerwarteter Fehler beim Anzeigen der Mods.", ex);
-            }
+                if (File.Exists(row.FullPath))
+                    File.Delete(row.FullPath);
+            }, _cts.Token);
+        }
+
+        // =========================================================
+        // Shared popup helpers
+        // =========================================================
+
+        private void ShowBusyPopup(string title, string message)
+        {
+            PopupTitleText.Text = title;
+            PopupMessageText.Text = string.IsNullOrWhiteSpace(message)
+                ? "Bitte warten..."
+                : message;
+
+            PopupPrimaryButton.Visibility = Visibility.Collapsed;
+            PopupSecondaryButton.Visibility = Visibility.Collapsed;
+            PopupCloseButton.Visibility = Visibility.Collapsed;
+
+            PopupPrimaryButton.IsEnabled = false;
+            PopupSecondaryButton.IsEnabled = false;
+
+            _popupPrimaryActionAsync = null;
+            _popupSecondaryActionAsync = null;
+            _popupAllowsBackdropClose = false;
+
+            PopupOverlay.Visibility = Visibility.Visible;
+            PopupOverlay.Opacity = 0;
+
+            var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(180));
+            PopupOverlay.BeginAnimation(OpacityProperty, fade);
+        }
+
+        private void UpdateBusyPopup(string title, string message)
+        {
+            PopupTitleText.Text = title;
+            PopupMessageText.Text = message;
         }
 
         private void ShowDecisionPopup(
@@ -1660,6 +1419,261 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
             var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(180));
             PopupOverlay.BeginAnimation(OpacityProperty, fade);
         }
+
+        private void ClosePopupImmediate()
+        {
+            PopupOverlay.BeginAnimation(OpacityProperty, null);
+            PopupOverlay.Visibility = Visibility.Collapsed;
+
+            _popupPrimaryActionAsync = null;
+            _popupSecondaryActionAsync = null;
+            _popupAllowsBackdropClose = true;
+        }
+
+        // =========================================================
+        // Error / view helpers
+        // =========================================================
+
+        private void ShowLoading() => SwitchView(LoadingView, ViewState.Loading);
+        private void ShowMain() => SwitchView(MainView, ViewState.Main);
+        private void ShowModManager() => SwitchView(ModManagerView, ViewState.ModManager);
+
+        private void ShowError(string message, string fullError)
+        {
+            ErrorMessageText.Text = message;
+            FullErrorText.Text = fullError;
+
+            FullErrorPanel.Visibility = Visibility.Collapsed;
+            ShowFullErrorButton.Content = "Vollständigen Fehler anzeigen";
+
+            SwitchView(ErrorView, ViewState.Error);
+        }
+
+        private bool StopWithError(string userMessage, string? technicalDetails = null)
+        {
+            ClosePopupImmediate();
+            HideModActionOverlay();
+            SetModManagerInteractiveState(true);
+
+            ShowError(
+                userMessage,
+                string.IsNullOrWhiteSpace(technicalDetails) ? userMessage : technicalDetails
+            );
+
+            return false;
+        }
+
+        private bool StopWithError(string userMessage, Exception ex)
+        {
+            return StopWithError(userMessage, ex.ToString());
+        }
+
+        private void SwitchView(UIElement target, ViewState state)
+        {
+            foreach (UIElement element in new[] { LoadingView, ErrorView, MainView, ModManagerView })
+            {
+                element.Visibility = Visibility.Collapsed;
+                element.Opacity = 0;
+            }
+
+            target.Visibility = Visibility.Visible;
+
+            var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(300));
+            target.BeginAnimation(OpacityProperty, fade);
+
+            CurrentView = state;
+        }
+
+        // =========================================================
+        // Main events
+        // =========================================================
+
+        private void GameButton_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (sender is Button btn && btn.Tag is Game game)
+                {
+                    _selectedGameName = game.Name;
+                    SelectedGameTitle.Text = game.Name;
+
+                    CheckGameState(game.Name);
+
+                    GameListView.Visibility = Visibility.Collapsed;
+                    GameMenuView.Visibility = Visibility.Visible;
+                }
+            }
+            catch (Exception ex)
+            {
+                StopWithError("Fehler beim Öffnen des Spiels.", ex);
+            }
+        }
+
+        private void BackToGameList_Click(object sender, RoutedEventArgs e)
+        {
+            GameMenuView.Visibility = Visibility.Collapsed;
+            GameListView.Visibility = Visibility.Visible;
+        }
+
+        private async void ManageMods_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (!_selectedGameInstalled)
+                {
+                    StopWithError("Das Spiel ist nicht installiert.");
+                    return;
+                }
+
+                if (string.IsNullOrWhiteSpace(_selectedGameModFolder))
+                {
+                    StopWithError("Kein Mod-Ordner für dieses Spiel gefunden.");
+                    return;
+                }
+
+                await RunExclusiveModActionAsync(async () =>
+                {
+                    ShowModManager();
+                    await LoadModManagerAsync();
+                });
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                StopWithError("Unerwarteter Fehler bei der Mod-Verwaltung.", ex);
+            }
+        }
+
+        private async void RefreshModManager_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                await RunExclusiveModActionAsync(async () =>
+                {
+                    await LoadModManagerAsync();
+                });
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                StopWithError("Fehler beim Neuladen der Mod-Verwaltung.", ex);
+            }
+        }
+
+        private void BackFromModManager_Click(object sender, RoutedEventArgs e)
+        {
+            ShowMain();
+        }
+
+        private async void ServerDownload_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (sender is not Button { Tag: ServerModRow row })
+                    return;
+
+                await RunExclusiveModActionAsync(async () =>
+                {
+                    SetModManagerInteractiveState(false);
+
+                    try
+                    {
+                        await ApplyServerModAsync(row.ServerFile, "Mod wird heruntergeladen");
+                        await LoadModManagerAsync();
+                        ModManagerStatusText.Text = $"{row.FileName} wurde heruntergeladen.";
+                    }
+                    finally
+                    {
+                        HideModActionOverlay();
+                        SetModManagerInteractiveState(true);
+                    }
+                });
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                StopWithError("Fehler beim Herunterladen der Mod.", ex);
+            }
+        }
+
+        private async void LocalUninstall_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (sender is not Button { Tag: LocalModRow row })
+                    return;
+
+                await RunExclusiveModActionAsync(async () =>
+                {
+                    SetModManagerInteractiveState(false);
+
+                    try
+                    {
+                        await RemoveLocalModAsync(row);
+                        await LoadModManagerAsync();
+                        ModManagerStatusText.Text = $"{row.FileName} wurde deinstalliert.";
+                    }
+                    finally
+                    {
+                        HideModActionOverlay();
+                        SetModManagerInteractiveState(true);
+                    }
+                });
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                StopWithError("Fehler beim Deinstallieren der Mod.", ex);
+            }
+        }
+
+        private async void LocalUpdate_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (sender is not Button { Tag: LocalModRow row })
+                    return;
+
+                if (!row.CanUpdate || row.ServerFile == null)
+                    return;
+
+                await RunExclusiveModActionAsync(async () =>
+                {
+                    SetModManagerInteractiveState(false);
+
+                    try
+                    {
+                        await ApplyServerModAsync(row.ServerFile, "Mod wird aktualisiert");
+                        await LoadModManagerAsync();
+                        ModManagerStatusText.Text = $"{row.FileName} wurde aktualisiert.";
+                    }
+                    finally
+                    {
+                        HideModActionOverlay();
+                        SetModManagerInteractiveState(true);
+                    }
+                });
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                StopWithError("Fehler beim Aktualisieren der Mod.", ex);
+            }
+        }
+
+        // =========================================================
+        // Shared popup events
+        // =========================================================
 
         private async void PopupPrimaryButton_Click(object sender, RoutedEventArgs e)
         {
@@ -1729,6 +1743,10 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
             }
         }
 
+        // =========================================================
+        // Error view events
+        // =========================================================
+
         private void CopyFullError_Click(object sender, RoutedEventArgs e)
         {
             try
@@ -1737,12 +1755,7 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
             }
             catch (Exception ex)
             {
-                MessageBox.Show(
-                    ex.Message,
-                    "Clipboard Error",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Error
-                );
+                StopWithError("Fehler beim Kopieren des Fehlers.", ex);
             }
         }
 
@@ -1789,6 +1802,10 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
             }
         }
 
+        // =========================================================
+        // Window events
+        // =========================================================
+
         private void Minimize_Click(object sender, RoutedEventArgs e)
         {
             WindowState = WindowState.Minimized;
@@ -1807,6 +1824,10 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
             }
         }
 
+        // =========================================================
+        // Sound events
+        // =========================================================
+
         private void Button_ClickSound(object sender, RoutedEventArgs e)
         {
             try
@@ -1821,12 +1842,7 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
 
                 if (stream == null)
                 {
-                    MessageBox.Show(
-                        "Embedded sound resource not found.",
-                        "Sound Error",
-                        MessageBoxButton.OK,
-                        MessageBoxImage.Error
-                    );
+                    StopWithError("Embedded sound resource not found.");
                     return;
                 }
 
@@ -1836,12 +1852,7 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
             }
             catch (Exception ex)
             {
-                MessageBox.Show(
-                    ex.Message,
-                    "Sound Error",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Error
-                );
+                StopWithError("Sound Error", ex);
             }
         }
 
@@ -1872,12 +1883,7 @@ GitHubAsset? exeAsset = release.Assets.FirstOrDefault(a =>
             }
             catch (Exception ex)
             {
-                MessageBox.Show(
-                    ex.Message,
-                    "Sound Error",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Error
-                );
+                StopWithError("Sound Error", ex);
             }
         }
     }
