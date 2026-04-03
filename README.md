@@ -1,6 +1,10 @@
 # BBsUMD
 BBs Universal Mod Downloader
 
+> [!NOTE]
+> Dieses Projekt ist nun offiziell stillgelegt und dieses Repository wird archiviert, da BBsUMD eine reine WPF-Anwendung für Windows war, ich inzwischen jedoch mit Linux arbeite.  
+> Ein Rewrite als Avalonia-App ist bereits geplant, wird dann aber in einem neuen Repository stattfinden.
+
 BBsUMD war als vereinfachter Modpack-Updater gedacht, um es allen in meinem Freundes- und Bekanntenkreis leichter zu machen, die Mods in unseren Spielen aktuell zu halten und sich den Aufwand mit unterschiedlichen Mod-Ordnern und ähnlichem zu sparen.
 
 Im Laufe der Entwicklung sollte auch die Serverseite automatisiert werden. Dabei hat sich jedoch herausgestellt, dass das automatische Herunterladen von Mods ohne Benutzereingabe nicht mit den [Nutzungsbedingungen von Nexus Mods](https://help.nexusmods.com/article/114-api-acceptable-use-policy) vereinbar ist.
